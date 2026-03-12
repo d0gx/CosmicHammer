@@ -187,6 +187,8 @@ No IP address is logged server-side beyond the standard 24-hour nginx rolling wi
 
 ## Build
 
+### Linux
+
 ```bash
 # Dependencies: gcc, glibc, libcurl (optional, for remote reporting)
 git clone https://github.com/fuzz-society/cosmic-rowhammer
@@ -197,20 +199,36 @@ make
 make WITH_CURL=1
 ```
 
+### Windows (MinGW/MSYS2)
+
+```powershell
+# Dependencies: gcc (MinGW-w64), mingw32-make, libcurl (optional)
+git clone https://github.com/fuzz-society/cosmic-rowhammer
+cd cosmic-rowhammer
+mingw32-make -f Makefile.windows
+
+# With remote reporting support
+mingw32-make -f Makefile.windows WITH_CURL=1
+```
+
 ### Requirements
 
 | | Minimum | Recommended |
 |---|---|---|
 | RAM | 1 GB free | 2 GB free |
-| Privileges | user | root (for `mlock`) |
-| OS | Linux 4.x+ | Linux 6.x |
+| Privileges | user | elevated shell for page locking (`mlock`/`VirtualLock`) |
+| OS | Linux 4.x+ or Windows 10+ | Linux 6.x / Windows 11 |
 | Arch | x86_64 | x86_64 / ARM64 |
 
 > **Root is recommended** to guarantee physical page pinning via `mlock()`. Without it, the OS may silently swap or remap pages, producing false negatives.
+>
+> On Windows, running in an elevated terminal similarly improves page locking reliability via `VirtualLock()`.
 
 ---
 
 ## Run
+
+### Linux
 
 ```bash
 # Local observation only
@@ -232,6 +250,22 @@ sudo setcap cap_ipc_lock+ep ./cosmic_rowhammer
 
 example report every 3days
 ./cosmic_rowhammer --report-url http://cosmos.fuzzsociety.org:5000/report --report-window 3d
+```
+
+### Windows
+
+```powershell
+# Local observation only
+.\cosmic_rowhammer.exe
+
+# With 72-hour anonymous reporting
+.\cosmic_rowhammer.exe --report-url https://data.cosmicrowhammer.io/report
+
+# Custom scan interval (seconds)
+.\cosmic_rowhammer.exe --interval 10
+
+# Report window example
+.\cosmic_rowhammer.exe --report-window 3d --report-url http://cosmos.fuzzsociety.org:5000/report
 ```
 
 ### Example Output

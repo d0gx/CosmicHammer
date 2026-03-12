@@ -1,0 +1,54 @@
+# ---------------------------------------------------------------------------
+# CosmicRowhammer - Windows Makefile (MinGW/MSYS2)
+# ---------------------------------------------------------------------------
+
+CC       ?= gcc
+TARGET   ?= cosmic_rowhammer.exe
+SRC      := cosmic_rowhammer.c
+
+CFLAGS   ?= -O2 -Wall -Wextra -std=gnu11 \
+            -D_WIN32_WINNT=0x0A00 \
+            -fstack-protector-strong \
+            -Wformat -Wformat-security
+
+LDFLAGS  ?= -lm
+
+ifdef WITH_CURL
+  CFLAGS  += -DWITH_CURL $(shell pkg-config --cflags libcurl 2>/dev/null || echo "")
+  LDFLAGS += $(shell pkg-config --libs   libcurl 2>/dev/null || echo "-lcurl")
+  $(info [+] Building with libcurl - remote reporting enabled)
+else
+  $(info [i] Building without libcurl - reports saved locally only)
+  $(info     To enable remote reporting: mingw32-make -f Makefile.windows WITH_CURL=1)
+endif
+
+DBGFLAGS := -O0 -g3 -fsanitize=address,undefined -fno-omit-frame-pointer -DDEBUG
+
+.PHONY: all debug clean help
+
+all: $(TARGET)
+
+$(TARGET): $(SRC)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo ""
+	@echo "  Built: .\\$(TARGET)"
+	@echo "  Run:   .\\$(TARGET) [--report-url <url>] [--altitude <m>]"
+	@echo ""
+
+debug: $(SRC)
+	$(CC) $(CFLAGS) $(DBGFLAGS) -o cosmic_rowhammer_debug.exe $^ $(LDFLAGS)
+	@echo "  Debug build: .\\cosmic_rowhammer_debug.exe"
+
+clean:
+	rm -f $(TARGET) cosmic_rowhammer_debug.exe *.o cr_report_*.json
+
+help:
+	@echo "CosmicRowhammer - Windows build targets:"
+	@echo "  mingw32-make -f Makefile.windows              Build (no remote reporting)"
+	@echo "  mingw32-make -f Makefile.windows WITH_CURL=1  Build with libcurl"
+	@echo "  mingw32-make -f Makefile.windows debug        Debug build + ASan/UBSan"
+	@echo "  mingw32-make -f Makefile.windows clean        Remove artefacts"
+	@echo ""
+	@echo "Runtime options:"
+	@echo "  .\\$(TARGET) --report-window 10s"
+	@echo "  .\\$(TARGET) --report-url https://data.cosmicrowhammer.io/report"
