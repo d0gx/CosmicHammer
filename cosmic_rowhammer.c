@@ -49,17 +49,25 @@
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
-#include <unistd.h>
+#include <locale.h>
 #include <signal.h>
 #include <errno.h>
 #include <math.h>
 #include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/utsname.h>
-#include <sys/sysinfo.h>
-#include <sys/resource.h>   /* getrlimit — mlock limit check        */
-#include <sys/stat.h>
-#include <cpuid.h>          /* GCC built-in CPUID (x86 only)        */
+
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#  include <io.h>
+#else
+#  include <unistd.h>
+#  include <sys/mman.h>
+#  include <sys/utsname.h>
+#  include <sys/sysinfo.h>
+#  include <sys/resource.h>
+#  include <sys/stat.h>
+#  include <cpuid.h>
+#endif
 
 #ifdef WITH_CURL
 #  include <curl/curl.h>
@@ -234,6 +242,13 @@ static int          opt_interval       = SCAN_INTERVAL_S;
 static long         opt_report_window  = DEFAULT_REPORT_S; /* configurable */
 static ReportWindow report_win         = {0};
 
+typedef struct {
+    char          sysname[32];
+    char          release[64];
+    char          machine[32];
+    unsigned long ram_mb;
+} HostInfo;
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Helpers
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -249,6 +264,236 @@ static const char *ts_now(char *buf, size_t n) {
 static int count_flipped_bits(uint64_t a, uint64_t b) {
     return __builtin_popcountll(a ^ b);
 }
+
+static void platform_init_console(void) {
+#ifdef _WIN32
+    HANDLE h;
+    DWORD mode;
+
+    /* Force UTF-8 console code pages so Unicode banners/logs render without
+     * requiring users to manually run chcp/encoding commands every session. */
+    h = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode))
+        SetConsoleOutputCP(CP_UTF8);
+
+    h = GetStdHandle(STD_INPUT_HANDLE);
+    if (h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode))
+        SetConsoleCP(CP_UTF8);
+
+    setlocale(LC_ALL, ".UTF-8");
+#else
+    setlocale(LC_ALL, "");
+#endif
+}
+
+static void platform_sleep_seconds(unsigned seconds) {
+#ifdef _WIN32
+    Sleep(seconds * 1000U);
+#else
+    sleep(seconds);
+#endif
+}
+
+static void platform_get_host_info(HostInfo *out) {
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    MEMORYSTATUSEX ms;
+    const char *arch = "unknown";
+
+    GetNativeSystemInfo(&si);
+    ms.dwLength = sizeof(ms);
+    if (!GlobalMemoryStatusEx(&ms))
+        ms.ullTotalPhys = 0;
+
+    switch (si.wProcessorArchitecture) {
+        case PROCESSOR_ARCHITECTURE_AMD64: arch = "x86_64"; break;
+        case PROCESSOR_ARCHITECTURE_INTEL: arch = "x86"; break;
+#ifdef PROCESSOR_ARCHITECTURE_ARM64
+        case PROCESSOR_ARCHITECTURE_ARM64: arch = "arm64"; break;
+#endif
+#ifdef PROCESSOR_ARCHITECTURE_ARM
+        case PROCESSOR_ARCHITECTURE_ARM: arch = "arm"; break;
+#endif
+        default: break;
+    }
+
+    snprintf(out->sysname, sizeof(out->sysname), "Windows");
+    snprintf(out->release, sizeof(out->release), "NT");
+    snprintf(out->machine, sizeof(out->machine), "%s", arch);
+    out->ram_mb = (unsigned long)(ms.ullTotalPhys / (1024ULL * 1024ULL));
+#else
+    struct utsname u;
+    struct sysinfo si;
+
+    if (uname(&u) == 0) {
+        snprintf(out->sysname, sizeof(out->sysname), "%s", u.sysname);
+        snprintf(out->release, sizeof(out->release), "%s", u.release);
+        snprintf(out->machine, sizeof(out->machine), "%s", u.machine);
+    } else {
+        snprintf(out->sysname, sizeof(out->sysname), "Linux");
+        snprintf(out->release, sizeof(out->release), "unknown");
+        snprintf(out->machine, sizeof(out->machine), "unknown");
+    }
+
+    if (sysinfo(&si) == 0)
+        out->ram_mb = si.totalram / (1024UL * 1024UL);
+    else
+        out->ram_mb = 0;
+#endif
+}
+
+static int platform_detect_ecc(void) {
+#ifdef _WIN32
+    return 0;
+#else
+    FILE *f = fopen("/sys/devices/system/edac/mc/mc0/ce_count", "r");
+    if (f) {
+        fclose(f);
+        return 1;
+    }
+    return 0;
+#endif
+}
+
+static void platform_release_arena(uint8_t *p) {
+    if (!p) return;
+#ifdef _WIN32
+    VirtualUnlock(p, ARENA_SIZE);
+    if (!VirtualFree(p, 0, MEM_RELEASE))
+        fprintf(stderr, "[!] VirtualFree failed (error=%lu)\n", (unsigned long)GetLastError());
+#else
+    munlock(p, ARENA_SIZE);
+    munmap(p, ARENA_SIZE);
+#endif
+}
+
+#ifdef _WIN32
+static unsigned long long bytes_to_mb_u64(size_t bytes) {
+    return (unsigned long long)(bytes / (1024ULL * 1024ULL));
+}
+
+static void win32_error_text(DWORD err, char *buf, size_t bufsz) {
+    if (!buf || bufsz == 0) return;
+    buf[0] = '\0';
+
+    DWORD n = FormatMessageA(
+        FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        NULL, err, 0, buf, (DWORD)bufsz, NULL
+    );
+
+    if (!n) {
+        snprintf(buf, bufsz, "Unknown Win32 error");
+        return;
+    }
+
+    while (n > 0 && (buf[n - 1] == '\r' || buf[n - 1] == '\n' || buf[n - 1] == '.'))
+        buf[--n] = '\0';
+}
+
+static int platform_raise_working_set(size_t lock_bytes) {
+    HANDLE h = GetCurrentProcess();
+    SIZE_T min_ws = 0, max_ws = 0;
+    DWORD flags = 0;
+    char errtxt[256];
+
+    if (!GetProcessWorkingSetSizeEx(h, &min_ws, &max_ws, &flags)) {
+        DWORD err = GetLastError();
+        win32_error_text(err, errtxt, sizeof(errtxt));
+        fprintf(stderr,
+            "[~] Could not read working set limits (error=%lu: %s).\n"
+            "    VirtualLock may fail if the default quota is too small.\n",
+            (unsigned long)err, errtxt);
+        return 0;
+    }
+
+    {
+        const size_t headroom = 256ULL * 1024ULL * 1024ULL;
+        SIZE_T desired_min = (SIZE_T)lock_bytes + (SIZE_T)headroom;
+        SIZE_T desired_max = desired_min + (SIZE_T)headroom;
+
+        if (desired_max < desired_min) desired_max = desired_min;
+
+        if (min_ws >= desired_min && max_ws >= desired_max) {
+            return 1; /* Already large enough. */
+        }
+
+        if (!SetProcessWorkingSetSizeEx(h, desired_min, desired_max, flags)) {
+            DWORD err = GetLastError();
+            BOOL in_job = FALSE;
+            win32_error_text(err, errtxt, sizeof(errtxt));
+            (void)IsProcessInJob(h, NULL, &in_job);
+
+            fprintf(stderr,
+                "[~] Auto-tune working set failed (error=%lu: %s)\n"
+                "    Current limits: min=%llu MB max=%llu MB\n"
+                "    Requested:      min=%llu MB max=%llu MB\n",
+                (unsigned long)err, errtxt,
+                bytes_to_mb_u64((size_t)min_ws), bytes_to_mb_u64((size_t)max_ws),
+                bytes_to_mb_u64((size_t)desired_min), bytes_to_mb_u64((size_t)desired_max));
+
+            if (err == ERROR_PRIVILEGE_NOT_HELD || err == ERROR_ACCESS_DENIED)
+                fprintf(stderr,
+                    "    Hint: run in an elevated (Administrator) terminal; "
+                    "Windows may require higher privileges to raise working set limits.\n");
+
+            if (in_job)
+                fprintf(stderr,
+                    "    Hint: this process is inside a Job object (common in IDE shells), "
+                    "which can enforce memory quotas.\n");
+
+            return 0;
+        }
+
+        if (GetProcessWorkingSetSizeEx(h, &min_ws, &max_ws, &flags)) {
+            printf("[+] Working set tuned for locking: min=%llu MB max=%llu MB\n",
+                   bytes_to_mb_u64((size_t)min_ws), bytes_to_mb_u64((size_t)max_ws));
+        } else {
+            printf("[+] Working set tuning requested before VirtualLock.\n");
+        }
+    }
+
+    return 1;
+}
+
+static void platform_diag_virtuallock_failure(DWORD err, size_t lock_bytes) {
+    HANDLE h = GetCurrentProcess();
+    SIZE_T min_ws = 0, max_ws = 0;
+    DWORD flags = 0;
+    BOOL in_job = FALSE;
+    char errtxt[256];
+
+    win32_error_text(err, errtxt, sizeof(errtxt));
+    (void)GetProcessWorkingSetSizeEx(h, &min_ws, &max_ws, &flags);
+    (void)IsProcessInJob(h, NULL, &in_job);
+
+    fprintf(stderr,
+        "[~] VirtualLock failed (error=%lu: %s)\n"
+        "    Lock request: %llu MB\n"
+        "    Working set:  min=%llu MB max=%llu MB\n",
+        (unsigned long)err, errtxt,
+        bytes_to_mb_u64(lock_bytes),
+        bytes_to_mb_u64((size_t)min_ws), bytes_to_mb_u64((size_t)max_ws));
+
+    if (err == ERROR_WORKING_SET_QUOTA)
+        fprintf(stderr,
+            "    Cause: working set quota is too small for this lock request.\n");
+
+    if (err == ERROR_PRIVILEGE_NOT_HELD || err == ERROR_ACCESS_DENIED)
+        fprintf(stderr,
+            "    Cause: insufficient privilege to lock this amount of memory.\n");
+
+    if (in_job)
+        fprintf(stderr,
+            "    Note: process is inside a Job object; quota policies may be enforced externally.\n");
+
+    fprintf(stderr,
+        "    Recommendation: run from an elevated terminal and/or lower arena size.\n"
+        "    The scanner will continue, but page residency is less stable and accuracy may drop.\n");
+}
+#endif
 
 /* ─── Report window parser ─────────────────────────────────────────────────
  * Accepts:  10s  30m  6h  3d  (or bare integer = seconds)
@@ -290,6 +535,9 @@ static const char *fmt_duration(long secs, char *buf, size_t n) {
 
 /* Returns 1 if we appear to be running inside a container (Docker / LXC / etc.) */
 static int detect_container(void) {
+#ifdef _WIN32
+    return 0;
+#else
     /* Most reliable: Docker always creates /.dockerenv                  */
     if (access("/.dockerenv", F_OK) == 0) return 1;
     /* cgroup v1: docker sets a non-trivial cgroup path                  */
@@ -305,10 +553,14 @@ static int detect_container(void) {
         fclose(f);
     }
     return 0;
+#endif
 }
 
 /* Check cgroup v1 memory limit; returns bytes or 0 if unlimited / unavailable */
 static uint64_t cgroup_mem_limit(void) {
+#ifdef _WIN32
+    return 0;
+#else
     const char *paths[] = {
         "/sys/fs/cgroup/memory/memory.limit_in_bytes",
         "/sys/fs/cgroup/memory.max",          /* cgroup v2 */
@@ -327,20 +579,28 @@ static uint64_t cgroup_mem_limit(void) {
         fclose(f);
     }
     return 0;
+#endif
 }
 
 /* Check if host KSM is active */
 static int ksm_active(void) {
+#ifdef _WIN32
+    return 0;
+#else
     FILE *f = fopen("/sys/kernel/mm/ksm/run", "r");
     if (!f) return 0;
     int v = 0;
     if (fscanf(f, "%d", &v) != 1) v = 0;
     fclose(f);
     return v;
+#endif
 }
 
 /* Check host THP policy */
 static const char *thp_policy(void) {
+#ifdef _WIN32
+    return "n/a";
+#else
     FILE *f = fopen("/sys/kernel/mm/transparent_hugepage/enabled", "r");
     if (!f) return "unknown";
     static char buf[64]; buf[0] = '\0';
@@ -351,6 +611,7 @@ static const char *thp_policy(void) {
     char *e = s ? strchr(s, ']') : NULL;
     if (s && e) { *e = '\0'; return s + 1; }
     return buf;
+#endif
 }
 
 
@@ -376,6 +637,25 @@ static const char *thp_policy(void) {
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static uint8_t *alloc_arena(void) {
+#ifdef _WIN32
+    void *p = VirtualAlloc(NULL, ARENA_SIZE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+    if (!p) {
+        DWORD err = GetLastError();
+        char errtxt[256];
+        win32_error_text(err, errtxt, sizeof(errtxt));
+        fprintf(stderr, "[!] VirtualAlloc failed (error=%lu: %s)\n", (unsigned long)err, errtxt);
+        return NULL;
+    }
+
+    (void)platform_raise_working_set(ARENA_SIZE);
+
+    if (!VirtualLock(p, ARENA_SIZE))
+        platform_diag_virtuallock_failure(GetLastError(), ARENA_SIZE);
+    else
+        printf("[+] Arena locked with VirtualLock.\n");
+
+    return (uint8_t *)p;
+#else
     /* Check cgroup limit before attempting mlock */
     uint64_t cg_limit = cgroup_mem_limit();
     if (cg_limit > 0 && cg_limit < ARENA_SIZE) {
@@ -423,6 +703,7 @@ static uint8_t *alloc_arena(void) {
         printf("[+] Arena mlocked — pages pinned in RAM.\n");
 
     return (uint8_t *)p;
+#endif
 }
 
 
@@ -682,17 +963,15 @@ static size_t scan_arena(uint8_t *base) {
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static void build_report_json(char *buf, size_t bufsz, const ReportWindow *w) {
-    struct utsname u; uname(&u);
-    struct sysinfo si; sysinfo(&si);
+    HostInfo hi;
+    platform_get_host_info(&hi);
     char wstart[32], wend[32];
 
     strftime(wstart, sizeof(wstart), "%Y-%m-%dT%H:%M:%SZ", gmtime(&w->window_start));
     strftime(wend,   sizeof(wend),   "%Y-%m-%dT%H:%M:%SZ", gmtime(&w->window_end));
 
     /* Detect ECC heuristically (sysfs) — best-effort */
-    int ecc = 0;
-    FILE *f = fopen("/sys/devices/system/edac/mc/mc0/ce_count", "r");
-    if (f) { ecc = 1; fclose(f); }
+    int ecc = platform_detect_ecc();
 
     /* Build altitude string separately to avoid compound-literal in snprintf */
     char alt_str[16];
@@ -746,9 +1025,9 @@ static void build_report_json(char *buf, size_t bufsz, const ReportWindow *w) {
         "  \"scan_cycles\":        %llu\n"
         "}\n",
         window_hours, wstart, wend,
-        u.machine,
-        u.sysname, u.release,
-        si.totalram / (1024*1024),
+        hi.machine,
+        hi.sysname, hi.release,
+        hi.ram_mb,
         ecc ? "true" : "false",
         alt_str,
         /* flip_totals */
@@ -855,8 +1134,8 @@ static void emit_report(void) {
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static void print_banner(void) {
-    struct utsname u; uname(&u);
-    struct sysinfo si; sysinfo(&si);
+    HostInfo hi;
+    platform_get_host_info(&hi);
     char dur[32];
     fmt_duration(opt_report_window, dur, sizeof(dur));
 
@@ -864,6 +1143,12 @@ static void print_banner(void) {
     int   ksm          = ksm_active();
     const char *thp    = thp_policy();
     uint64_t cg        = cgroup_mem_limit();
+    const char *thp_hint =
+#ifdef _WIN32
+        "";
+#else
+        " (set to 'never' or 'madvise' for best results)";
+#endif
 
     char cg_str[48] = "";
     if (cg) snprintf(cg_str, sizeof(cg_str), "  (cgroup limit: %llu MB)",
@@ -876,18 +1161,18 @@ static void print_banner(void) {
            "  RAM       %lu MB%s\n"
            "  Container %s\n"
            "  KSM       %s\n"
-           "  THP       %s (set to 'never' or 'madvise' for best results)\n"
+           "  THP       %s%s\n"
            "  Arena     512 MB  /  5 regions  (~102 MB each)\n"
            "  Regions   POINTER | RETADDR | PERMISSION | DATA | PTE_SIM\n"
            "  Interval  %d s\n"
            "  Window    %s%s\n"
            "  Curl      %s\n",
            VERSION,
-           u.sysname, u.release, u.machine,
-           si.totalram / (1024*1024), cg_str,
+           hi.sysname, hi.release, hi.machine,
+           hi.ram_mb, cg_str,
            in_container ? "YES — THP/KSM mitigations applied" : "no",
            ksm  ? "ACTIVE ⚠  (host KSM may merge arena pages — false positives possible)" : "off",
-           thp,
+           thp, thp_hint,
            opt_interval,
            dur,
            report_url[0] ? " → remote POST" : " → local JSON",
@@ -959,8 +1244,13 @@ static void parse_args(int argc, char *argv[]) {
                 "  --altitude      <m>     Altitude in metres (logged in report)\n"
                 "  --interval      <s>     Scan interval in seconds (default: %d)\n\n"
                 "Examples:\n"
+#ifdef _WIN32
+                "  .\\cosmic_rowhammer.exe --report-window 10s   # quick test\n"
+                "  .\\cosmic_rowhammer.exe --report-window 3d --report-url https://...\n",
+#else
                 "  sudo ./cosmic_rowhammer --report-window 10s   # quick test\n"
                 "  sudo ./cosmic_rowhammer --report-window 3d --report-url https://...\n",
+#endif
                 SCAN_INTERVAL_S);
             exit(0);
         }
@@ -972,10 +1262,13 @@ static void parse_args(int argc, char *argv[]) {
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 int main(int argc, char *argv[]) {
+    platform_init_console();
     parse_args(argc, argv);
 
     signal(SIGINT,  sig_handler);
+#ifdef SIGTERM
     signal(SIGTERM, sig_handler);
+#endif
 
     print_banner();
 
@@ -995,7 +1288,7 @@ int main(int argc, char *argv[]) {
 
     while (running) {
         spray_pass(arena);
-        sleep((unsigned)opt_interval);
+        platform_sleep_seconds((unsigned)opt_interval);
 
         char ts[32]; ts_now(ts, sizeof(ts));
         size_t found = scan_arena(arena);
@@ -1018,8 +1311,7 @@ int main(int argc, char *argv[]) {
     emit_report();
     print_stats(start);
 
-    munlock(arena, ARENA_SIZE);
-    munmap(arena,  ARENA_SIZE);
+    platform_release_arena(arena);
     printf("[*] Arena released. Goodbye.\n");
     return 0;
 }
